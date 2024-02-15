@@ -6,13 +6,16 @@ VOLUME_PATH="container.tc"
 MOUNT_POINT="/Volumes/cracked"
 WORDLIST="wordlist.txt"
 MIN_COMBINATION_LENGTH=1
-MAX_COMBINATION_LENGTH=3
+MAX_COMBINATION_LENGTH=4
 REPEAT_SINGLE_WORD=0
-MAX_PARALLEL_JOBS=4
+MAX_PARALLEL_JOBS=8
+PASSWORD_FOUND_FILE="password_found"
 
-# Initialize counters and flags
-PASSWORD_FOUND=0
+# Initialize
 CURRENT_ATTEMPT=0
+
+# Clean up the signal file at the start
+rm -f "$PASSWORD_FOUND_FILE"
 
 # Load wordlist into array
 read_wordlist_into_array() {
@@ -24,15 +27,13 @@ read_wordlist_into_array() {
     WORDLIST_COUNT=$i
 }
 
-# Initialize wordlist array
 declare -a WORDLIST_ARRAY
 read_wordlist_into_array
 
-# Calculate total number of attempts for progress display
 calculate_total_attempts() {
     local total=0
     if [ $REPEAT_SINGLE_WORD -eq 1 ]; then
-        total=$(($WORDLIST_COUNT * ($MAX_COMBINATION_LENGTH - $MIN_COMBINATION_LENGTH + 1)))
+        total=$((WORDLIST_COUNT * (MAX_COMBINATION_LENGTH - MIN_COMBINATION_LENGTH + 1)))
     else
         for ((depth=MIN_COMBINATION_LENGTH; depth<=MAX_COMBINATION_LENGTH; depth++)); do
             total=$(($total + ${#WORDLIST_ARRAY[@]} ** depth))
@@ -50,46 +51,52 @@ try_password() {
     echo "Attempt $CURRENT_ATTEMPT of $TOTAL_ATTEMPTS: Trying password '$password'"
     (
         if "$VERACRYPT_PATH" --text --non-interactive --password="$password" "$VOLUME_PATH" "$MOUNT_POINT" &>/dev/null; then
-            PASSWORD_FOUND=1
             echo "Password found: $password"
-            pkill -P $$ # Kill all child processes of this script
+            touch "$PASSWORD_FOUND_FILE"
+            exit 0
         fi
     ) &
+    PID=$!
+    echo "Launched VeraCrypt attempt with PID: $PID"
+}
+
+# Check for the temporary file indicating the password was found
+check_password_found() {
+    if [ -f "$PASSWORD_FOUND_FILE" ]; then
+        echo "Password found, stopping attempts..."
+        return 0 # Password found
+    fi
+    return 1 # Password not found
 }
 
 # Function to ensure we do not exceed MAX_PARALLEL_JOBS
 check_jobs() {
     while [ $(jobs -p | wc -l) -ge "$MAX_PARALLEL_JOBS" ]; do
-        sleep 1 # Simple delay to avoid overloading the CPU with checks
+        sleep 1
+        check_password_found && pkill -P $$ && break
     done
 }
 
-# Recursive function to generate combinations and try them
 generate_combinations() {
     local prefix="$1"
     local depth="$2"
     if [ "$depth" -eq 0 ]; then
         try_password "$prefix"
         check_jobs
+        check_password_found && return
         return
     fi
-    if [ $REPEAT_SINGLE_WORD -eq 1 ]; then
-        for word in "${WORDLIST_ARRAY[@]}"; do
-            if [ $PASSWORD_FOUND -eq 1 ]; then break; fi
-            generate_combinations "$word" $(($depth - 1))
-        done
-    else
-        for word in "${WORDLIST_ARRAY[@]}"; do
-            if [ $PASSWORD_FOUND -eq 1 ]; then break; fi
-            generate_combinations "$prefix$word" $(($depth - 1))
-        done
-    fi
+    for word in "${WORDLIST_ARRAY[@]}"; do
+        generate_combinations "$prefix$word" $(($depth - 1))
+        check_password_found && break
+    done
 }
 
 # Handle interrupt signal
 interrupt_handler() {
-    echo "Interrupt signal received. Exiting..."
-    pkill -P $$ # Kill all child processes of this script
+    echo "Interrupt signal received. Cleaning up..."
+    rm -f "$PASSWORD_FOUND_FILE"
+    pkill -P $$
     exit 1
 }
 
@@ -100,11 +107,15 @@ main() {
     echo "Starting brute-force attack with $TOTAL_ATTEMPTS possible combinations."
     for ((depth=MIN_COMBINATION_LENGTH; depth<=MAX_COMBINATION_LENGTH; depth++)); do
         generate_combinations "" $depth
+        check_password_found && echo "Stopping further attempts." && break
     done
     wait # Wait for all background jobs to finish
-    if [ $PASSWORD_FOUND -eq 0 ]; then
+    if [ -f "$PASSWORD_FOUND_FILE" ]; then
+        echo "Password successfully found."
+    else
         echo "Password not found with the given combinations."
     fi
+    rm -f "$PASSWORD_FOUND_FILE"
 }
 
 main
